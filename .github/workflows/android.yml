@@ -1,0 +1,104 @@
+name: Build test APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - osint-mobile-src.zip
+      - .github/workflows/android.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CI: '1'
+    defaults:
+      run:
+        working-directory: project
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract source ZIP
+        working-directory: .
+        run: |
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import Path
+          root = Path('project').resolve()
+          with zipfile.ZipFile('osint-mobile-src.zip') as archive:
+              for entry in archive.infolist():
+                  destination = (root / entry.filename).resolve()
+                  if not destination.is_relative_to(root):
+                      raise ValueError('Unsafe ZIP path')
+              archive.extractall(root)
+          if not (root / 'package.json').is_file():
+              raise SystemExit('Expected package.json at the top level of the ZIP')
+          PY
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: project/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck and tests
+        run: npm run check
+
+      - name: Generate Android project
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Configure test-only signing
+        run: |
+          # Use a fresh disposable key, never a production signing secret.
+          rm -f android/app/debug.keystore
+          keytool -genkeypair -keystore android/app/debug.keystore \
+            -storepass android -alias androiddebugkey -keypass android \
+            -dname 'CN=Android Debug,O=Android,C=US' \
+            -keyalg RSA -keysize 2048 -validity 10000
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('android/app/build.gradle')
+          text = p.read_text()
+          if 'signingConfig signingConfigs.debug' not in text:
+              raise SystemExit('Generated template signing changed; review build.gradle before building')
+          PY
+
+      - name: Build standalone test APK
+        run: |
+          chmod +x android/gradlew
+          cd android
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APK
+        run: |
+          mkdir -p artifacts
+          cp android/app/build/outputs/apk/release/app-release.apk artifacts/osint-test.apk
+          sha256sum artifacts/osint-test.apk > artifacts/SHA256SUMS.txt
+          echo 'Download osint-test-apk under Artifacts below and extract the ZIP. This is a standalone test build signed with a disposable debug key, not a production release. A later build may require uninstalling the old app first, which deletes its local data.' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: osint-test-apk
+          path: project/artifacts/*
+          if-no-files-found: error
+          retention-days: 7
